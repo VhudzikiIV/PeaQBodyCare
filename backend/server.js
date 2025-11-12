@@ -4,45 +4,142 @@ const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
 const path = require('path');
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// Security and performance middleware
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
+app.use(compression());
 
-// Serve static images
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 1000 // limit each IP to 1000 requests per windowMs
+});
+app.use(limiter);
+
+// CORS configuration - allow all origins for public deployment
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps, curl requests)
+    if (!origin) return callback(null, true);
+    
+    // Allow all origins for public deployment
+    return callback(null, true);
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-auth', 'Origin', 'Accept']
+}));
+
+// Body parsing middleware
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Serve static files from multiple directories
 app.use('/images', express.static(path.join(__dirname, 'images')));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// MySQL connection
+// Serve React build in production
+if (process.env.NODE_ENV === 'production') {
+  app.use(express.static(path.join(__dirname, 'client/build')));
+}
+
+// ✅ UPDATED: MySQL connection pool with correct password
 const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
   port: process.env.DB_PORT || 3306,
   user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || 'dzika.123',
+  password: process.env.DB_PASSWORD || 'dzika.123', // Using your password directly as fallback
   database: process.env.DB_NAME || 'peaqbodycare',
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0
+  queueLimit: 0,
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 0
 });
 
-// Admin middleware to check if user is admin
+// Enhanced database connection test
+async function testConnection() {
+  let connection;
+  try {
+    console.log('🔧 Attempting to connect to MySQL...');
+    console.log('🔧 Connection details:', {
+      host: process.env.DB_HOST || 'localhost',
+      port: process.env.DB_PORT || 3306,
+      user: process.env.DB_USER || 'root',
+      database: process.env.DB_NAME || 'peaqbodycare',
+      password: process.env.DB_PASSWORD ? '***' : 'not set'
+    });
+
+    connection = await pool.getConnection();
+    console.log('✅ Connected to MySQL database:', process.env.DB_NAME || 'peaqbodycare');
+    
+    // Test query
+    const [rows] = await connection.execute('SELECT 1 as test');
+    console.log('✅ Database test query successful');
+    
+    connection.release();
+    return true;
+  } catch (error) {
+    console.error('❌ Database connection failed:', error.message);
+    console.log('💡 Troubleshooting tips:');
+    console.log('1. Check if MySQL service is running');
+    console.log('2. Verify username and password in .env file');
+    console.log('3. Ensure database exists');
+    console.log('4. Check MySQL user privileges');
+    
+    if (connection) {
+      connection.release();
+    }
+    return false;
+  }
+}
+
+// Admin middleware
 const requireAdmin = (req, res, next) => {
   const isAdmin = req.headers['x-admin-auth'] === 'true' || 
                  (req.body.email && req.body.email.endsWith('@admin.com'));
   
   if (!isAdmin) {
-    return res.status(403).json({ message: 'Admin access required' });
+    return res.status(403).json({ 
+      success: false,
+      message: 'Admin access required' 
+    });
   }
   next();
 };
+
+// Response formatter middleware
+app.use((req, res, next) => {
+  const originalSend = res.send;
+  res.send = function(data) {
+    if (typeof data === 'object' && !data.success !== undefined) {
+      data = {
+        success: !res.statusCode || res.statusCode < 400,
+        ...data
+      };
+    }
+    originalSend.call(this, data);
+  };
+  next();
+});
 
 // Initialize database
 async function initializeDatabase() {
   try {
     const connection = await pool.getConnection();
-    console.log('✅ Connected to MySQL database: peaqbodycare');
+    console.log('✅ Database connection established');
+    
+    // Create database if it doesn't exist
+    await connection.execute(`CREATE DATABASE IF NOT EXISTS ${process.env.DB_NAME || 'peaqbodycare'}`);
+    await connection.execute(`USE ${process.env.DB_NAME || 'peaqbodycare'}`);
     
     // Create users table
     await connection.execute(`
@@ -52,11 +149,13 @@ async function initializeDatabase() {
         last_name VARCHAR(100) NOT NULL,
         email VARCHAR(255) UNIQUE NOT NULL,
         password VARCHAR(255) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_email (email)
       )
     `);
     
-    // Create products table with additional fields including active
+    // Create products table
     await connection.execute(`
       CREATE TABLE IF NOT EXISTS products (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -68,12 +167,11 @@ async function initializeDatabase() {
         description TEXT,
         featured BOOLEAN DEFAULT FALSE,
         stock_quantity INT DEFAULT 100,
-        active BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         INDEX idx_category (category),
         INDEX idx_featured (featured),
-        INDEX idx_active (active)
+        INDEX idx_name (name)
       )
     `);
 
@@ -98,7 +196,8 @@ async function initializeDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         INDEX idx_order_number (order_number),
         INDEX idx_customer_email (customer_email),
-        INDEX idx_status (status)
+        INDEX idx_status (status),
+        INDEX idx_order_date (order_date)
       )
     `);
 
@@ -130,30 +229,29 @@ async function initializeDatabase() {
 // Insert sample products
 async function insertSampleProducts(connection) {
   try {
-    // Check if products already exist
     const [existingProducts] = await connection.execute('SELECT COUNT(*) as count FROM products');
     
     if (existingProducts[0].count === 0) {
       const products = [
         // For Her Collection
-        { name: 'Velvet Torrida', category: 'For Her', size: '50ml', price: 119.99, image_url: '/images/1762590894043.jpeg', description: 'Luxurious velvet scent with warm notes', featured: true, active: true },
-        { name: 'Good Girl Inspired', category: 'For Her', size: '30ml', price: 49.99, image_url: '/images/1762590894051.jpeg', description: 'Elegant and sophisticated fragrance', featured: true, active: true },
-        { name: 'VIP For Her', category: 'For Her', size: '30ml', price: 49.99, image_url: '/images/1762590894062.jpeg', description: 'Exclusive VIP scent experience', featured: false, active: true },
+        { name: 'Velvet Torrida', category: 'For Her', size: '50ml', price: 119.99, image_url: '/images/velvet-torrida.jpg', description: 'Luxurious velvet scent with warm notes', featured: true },
+        { name: 'Good Girl Inspired', category: 'For Her', size: '30ml', price: 49.99, image_url: '/images/good-girl.jpg', description: 'Elegant and sophisticated fragrance', featured: true },
+        { name: 'VIP For Her', category: 'For Her', size: '30ml', price: 49.99, image_url: '/images/vip-her.jpg', description: 'Exclusive VIP scent experience', featured: false },
         
         // For Him Collection
-        { name: 'Royal For Him', category: 'For Him', size: '30ml', price: 49.99, image_url: '/images/1762590894062.jpeg', description: 'Royal masculine fragrance', featured: true, active: true },
-        { name: 'Velvet For Him', category: 'For Him', size: '50ml', price: 119.99, image_url: '/images/1762590894089.jpeg', description: 'Velvet masculine scent', featured: true, active: true },
+        { name: 'Royal For Him', category: 'For Him', size: '30ml', price: 49.99, image_url: '/images/royal-him.jpg', description: 'Royal masculine fragrance', featured: true },
+        { name: 'Velvet For Him', category: 'For Him', size: '50ml', price: 119.99, image_url: '/images/velvet-him.jpg', description: 'Velvet masculine scent', featured: true },
         
         // New Arrivals
-        { name: 'Golden Moment', category: 'New Arrivals', size: '30ml', price: 49.99, image_url: '/images/1762590894035.jpeg', description: 'Your golden moment awaits', featured: true, active: true },
-        { name: 'Velvet Range', category: 'New Arrivals', size: '30ml', price: 49.99, image_url: '/images/1762590894071.jpeg', description: 'New velvet range collection', featured: true, active: true },
-        { name: 'Travel Size', category: 'New Arrivals', size: '30ml', price: 49.99, image_url: '/images/1762590894080.jpeg', description: 'New travel size convenience', featured: true, active: true }
+        { name: 'Golden Moment', category: 'New Arrivals', size: '30ml', price: 49.99, image_url: '/images/golden-moment.jpg', description: 'Your golden moment awaits', featured: true },
+        { name: 'Velvet Range', category: 'New Arrivals', size: '30ml', price: 49.99, image_url: '/images/velvet-range.jpg', description: 'New velvet range collection', featured: true },
+        { name: 'Travel Size', category: 'New Arrivals', size: '30ml', price: 49.99, image_url: '/images/travel-size.jpg', description: 'New travel size convenience', featured: true }
       ];
 
       for (const product of products) {
         await connection.execute(
-          'INSERT INTO products (name, category, size, price, image_url, description, featured, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-          [product.name, product.category, product.size, product.price, product.image_url, product.description, product.featured, product.active]
+          'INSERT INTO products (name, category, size, price, image_url, description, featured) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [product.name, product.category, product.size, product.price, product.image_url, product.description, product.featured]
         );
       }
       console.log('✅ Sample products inserted');
@@ -165,32 +263,89 @@ async function insertSampleProducts(connection) {
   }
 }
 
-// Routes
+// API Routes
 
-// Get all products (only active ones for customers)
-app.get('/api/products', async (req, res) => {
+// Health check
+app.get('/api/health', async (req, res) => {
   try {
-    const [products] = await pool.execute(
-      'SELECT * FROM products WHERE active = TRUE ORDER BY category, name'
-    );
-    res.json(products);
+    await pool.execute('SELECT 1');
+    res.json({ 
+      success: true,
+      status: 'OK', 
+      database: 'Connected',
+      timestamp: new Date().toISOString(),
+      environment: process.env.NODE_ENV || 'development'
+    });
   } catch (error) {
-    console.error('Products error:', error);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ 
+      success: false,
+      status: 'Error', 
+      database: 'Disconnected',
+      error: error.message 
+    });
   }
 });
 
-// Get products by category (only active)
+// Get all products
+app.get('/api/products', async (req, res) => {
+  try {
+    const [products] = await pool.execute('SELECT * FROM products ORDER BY category, name');
+    res.json({
+      success: true,
+      data: products,
+      count: products.length
+    });
+  } catch (error) {
+    console.error('Products error:', error);
+    res.status(500).json({ 
+      success: false,
+      message: 'Server error fetching products' 
+    });
+  }
+});
+
+// Get products by category
 app.get('/api/products/:category', async (req, res) => {
   try {
     const [products] = await pool.execute(
-      'SELECT * FROM products WHERE category = ? AND active = TRUE ORDER BY name',
+      'SELECT * FROM products WHERE category = ? ORDER BY name',
       [req.params.category]
     );
-    res.json(products);
+    res.json({
+      success: true,
+      data: products,
+      count: products.length,
+      category: req.params.category
+    });
   } catch (error) {
     console.error('Category products error:', error);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ 
+      success: false,
+      message: 'Server error fetching category products' 
+    });
+  }
+});
+
+// Search products
+app.get('/api/products/search/:query', async (req, res) => {
+  try {
+    const searchQuery = `%${req.params.query}%`;
+    const [products] = await pool.execute(
+      'SELECT * FROM products WHERE name LIKE ? OR description LIKE ? OR category LIKE ? ORDER BY name',
+      [searchQuery, searchQuery, searchQuery]
+    );
+    res.json({
+      success: true,
+      data: products,
+      count: products.length,
+      query: req.params.query
+    });
+  } catch (error) {
+    console.error('Search products error:', error);
+    res.status(500).json({ 
+      success: false,
+      message: 'Server error searching products' 
+    });
   }
 });
 
@@ -200,7 +355,10 @@ app.post('/api/register', async (req, res) => {
     const { firstName, lastName, email, password } = req.body;
 
     if (!firstName || !lastName || !email || !password) {
-      return res.status(400).json({ message: 'All fields are required' });
+      return res.status(400).json({ 
+        success: false,
+        message: 'All fields are required' 
+      });
     }
 
     const [existingUsers] = await pool.execute(
@@ -209,7 +367,10 @@ app.post('/api/register', async (req, res) => {
     );
 
     if (existingUsers.length > 0) {
-      return res.status(400).json({ message: 'User already exists' });
+      return res.status(400).json({ 
+        success: false,
+        message: 'User already exists' 
+      });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -219,13 +380,17 @@ app.post('/api/register', async (req, res) => {
     );
 
     res.status(201).json({ 
+      success: true,
       message: 'Registered successfully',
       userId: result.insertId 
     });
 
   } catch (error) {
     console.error('Registration error:', error);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ 
+      success: false,
+      message: 'Server error during registration' 
+    });
   }
 });
 
@@ -235,7 +400,10 @@ app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
 
     if (!email || !password) {
-      return res.status(400).json({ message: 'Email and password required' });
+      return res.status(400).json({ 
+        success: false,
+        message: 'Email and password required' 
+      });
     }
 
     const [users] = await pool.execute(
@@ -244,17 +412,24 @@ app.post('/api/login', async (req, res) => {
     );
 
     if (users.length === 0) {
-      return res.status(401).json({ message: 'Invalid email or password' });
+      return res.status(401).json({ 
+        success: false,
+        message: 'Invalid email or password' 
+      });
     }
 
     const user = users[0];
     const isPasswordValid = await bcrypt.compare(password, user.password);
 
     if (!isPasswordValid) {
-      return res.status(401).json({ message: 'Invalid email or password' });
+      return res.status(401).json({ 
+        success: false,
+        message: 'Invalid email or password' 
+      });
     }
 
     res.json({
+      success: true,
       message: 'Login successful',
       user: {
         id: user.id,
@@ -266,11 +441,99 @@ app.post('/api/login', async (req, res) => {
 
   } catch (error) {
     console.error('Login error:', error);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ 
+      success: false,
+      message: 'Server error during login' 
+    });
   }
 });
 
-// Generate WhatsApp message function - FIXED VERSION
+// Orders routes
+app.post('/api/orders', async (req, res) => {
+  try {
+    const orderData = req.body;
+    const { customer, items, subtotal, total, orderNumber } = orderData;
+    
+    if (!customer || !items || !subtotal || !total) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required order data'
+      });
+    }
+
+    const shippingFee = 50.00;
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    try {
+      const [orderResult] = await connection.execute(
+        `INSERT INTO orders (
+          order_number, customer_name, customer_email, customer_phone, 
+          customer_address, customer_city, customer_postal_code, customer_province,
+          delivery_instructions, subtotal, shipping_fee, total_amount
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          orderNumber || `PEAQ-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          `${customer.firstName} ${customer.lastName}`,
+          customer.email,
+          customer.phone,
+          customer.address,
+          customer.city,
+          customer.postalCode,
+          customer.province,
+          customer.deliveryInstructions || '',
+          parseFloat(subtotal),
+          shippingFee,
+          parseFloat(total)
+        ]
+      );
+
+      const orderId = orderResult.insertId;
+
+      for (const item of items) {
+        await connection.execute(
+          `INSERT INTO order_items (
+            order_id, product_name, product_category, product_size, product_price, quantity
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+          [
+            orderId,
+            item.name,
+            item.category,
+            item.size,
+            parseFloat(item.price),
+            item.quantity || 1
+          ]
+        );
+      }
+
+      await connection.commit();
+      connection.release();
+
+      const whatsappMessage = generateWhatsAppMessage(orderData, orderNumber);
+      
+      res.status(201).json({
+        success: true,
+        message: 'Order created successfully',
+        orderId: orderId,
+        orderNumber: orderNumber,
+        whatsappMessage: whatsappMessage
+      });
+    } catch (error) {
+      await connection.rollback();
+      connection.release();
+      console.error('Order transaction error:', error);
+      throw error;
+    }
+  } catch (error) {
+    console.error('Order creation error:', error);
+    res.status(500).json({ 
+      success: false,
+      message: 'Error creating order: ' + error.message 
+    });
+  }
+});
+
+// Generate WhatsApp message
 function generateWhatsAppMessage(orderData, orderNumber) {
   const { customer, items, subtotal, total } = orderData;
   
@@ -287,12 +550,7 @@ function generateWhatsAppMessage(orderData, orderNumber) {
   
   message += `*Order Items:*\n`;
   items.forEach((item, index) => {
-    // Make sure we're accessing the correct properties
-    const itemName = item.name || item.product_name || 'Product';
-    const itemSize = item.size || item.product_size || 'Size not specified';
-    const itemPrice = item.price || item.product_price || 0;
-    
-    message += `${index + 1}. ${itemName} - ${itemSize} - R${parseFloat(itemPrice).toFixed(2)}\n`;
+    message += `${index + 1}. ${item.name} - ${item.size} - R${item.price}\n`;
   });
   
   message += `\n*Order Summary:*\n`;
@@ -311,158 +569,6 @@ function generateWhatsAppMessage(orderData, orderNumber) {
   return encodeURIComponent(message);
 }
 
-// Orders routes - FIXED VERSION
-app.post('/api/orders', async (req, res) => {
-  try {
-    const orderData = req.body;
-    const { customer, items, subtotal, total, orderNumber } = orderData;
-    
-    // Validate that items have the required properties
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ message: 'Invalid order items' });
-    }
-
-    // Validate each item has required properties
-    for (const item of items) {
-      if (!item.name || !item.size || !item.price) {
-        return res.status(400).json({ 
-          message: 'Each product must have name, size, and price' 
-        });
-      }
-    }
-    
-    // Calculate shipping fee (R50 fixed)
-    const shippingFee = 50.00;
-    
-    // Start transaction
-    const connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    try {
-      // Insert order
-      const [orderResult] = await connection.execute(
-        `INSERT INTO orders (
-          order_number, customer_name, customer_email, customer_phone, 
-          customer_address, customer_city, customer_postal_code, customer_province,
-          delivery_instructions, subtotal, shipping_fee, total_amount
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          orderNumber,
-          `${customer.firstName} ${customer.lastName}`,
-          customer.email,
-          customer.phone,
-          customer.address,
-          customer.city,
-          customer.postalCode,
-          customer.province,
-          customer.deliveryInstructions || '',
-          parseFloat(subtotal),
-          shippingFee,
-          parseFloat(total)
-        ]
-      );
-
-      const orderId = orderResult.insertId;
-
-      // Insert order items with proper data
-      for (const item of items) {
-        await connection.execute(
-          `INSERT INTO order_items (
-            order_id, product_name, product_category, product_size, product_price, quantity
-          ) VALUES (?, ?, ?, ?, ?, ?)`,
-          [
-            orderId,
-            item.name,
-            item.category || 'Uncategorized',
-            item.size,
-            parseFloat(item.price),
-            1
-          ]
-        );
-      }
-
-      await connection.commit();
-      connection.release();
-
-      console.log('✅ Order created successfully:', orderNumber);
-      
-      // Generate WhatsApp message with proper data
-      const whatsappMessage = generateWhatsAppMessage(orderData, orderNumber);
-      
-      res.status(201).json({
-        message: 'Order created successfully',
-        orderId: orderId,
-        orderNumber: orderNumber,
-        orderDetails: orderData,
-        whatsappMessage: whatsappMessage
-      });
-    } catch (error) {
-      await connection.rollback();
-      connection.release();
-      console.error('Order transaction error:', error);
-      throw error;
-    }
-  } catch (error) {
-    console.error('Order creation error:', error);
-    res.status(500).json({ message: 'Error creating order: ' + error.message });
-  }
-});
-
-// Get WhatsApp link endpoint - FIXED VERSION
-app.get('/api/orders/whatsapp/:orderNumber', async (req, res) => {
-  try {
-    const { orderNumber } = req.params;
-    
-    const [orders] = await pool.execute(
-      'SELECT * FROM orders WHERE order_number = ?',
-      [orderNumber]
-    );
-
-    if (orders.length === 0) {
-      return res.status(404).json({ message: 'Order not found' });
-    }
-
-    const [orderItems] = await pool.execute(
-      'SELECT * FROM order_items WHERE order_id = ?',
-      [orders[0].id]
-    );
-
-    const orderData = {
-      customer: {
-        firstName: orders[0].customer_name.split(' ')[0],
-        lastName: orders[0].customer_name.split(' ').slice(1).join(' '),
-        phone: orders[0].customer_phone,
-        email: orders[0].customer_email,
-        address: orders[0].customer_address,
-        city: orders[0].customer_city,
-        postalCode: orders[0].customer_postal_code,
-        province: orders[0].customer_province,
-        deliveryInstructions: orders[0].delivery_instructions
-      },
-      items: orderItems.map(item => ({
-        name: item.product_name,
-        category: item.product_category,
-        size: item.product_size,
-        price: item.product_price
-      })),
-      subtotal: orders[0].subtotal,
-      total: orders[0].total_amount
-    };
-
-    const whatsappMessage = generateWhatsAppMessage(orderData, orderNumber);
-    const whatsappNumber = '27796989762';
-    const whatsappUrl = `https://wa.me/${whatsappNumber}?text=${whatsappMessage}`;
-
-    res.json({
-      whatsappUrl: whatsappUrl,
-      orderNumber: orderNumber
-    });
-  } catch (error) {
-    console.error('WhatsApp link error:', error);
-    res.status(500).json({ message: 'Error generating WhatsApp link' });
-  }
-});
-
 // Get user orders
 app.get('/api/orders/:email', async (req, res) => {
   try {
@@ -477,72 +583,57 @@ app.get('/api/orders/:email', async (req, res) => {
       [email]
     );
 
-    res.json(orders);
-  } catch (error) {
-    console.error('Get orders error:', error);
-    res.status(500).json({ message: 'Error fetching orders' });
-  }
-});
-
-// Get order details
-app.get('/api/order/:orderNumber', async (req, res) => {
-  try {
-    const { orderNumber } = req.params;
-    
-    const [orders] = await pool.execute(
-      'SELECT * FROM orders WHERE order_number = ?',
-      [orderNumber]
-    );
-
-    if (orders.length === 0) {
-      return res.status(404).json({ message: 'Order not found' });
-    }
-
-    const [orderItems] = await pool.execute(
-      'SELECT * FROM order_items WHERE order_id = ?',
-      [orders[0].id]
-    );
-
     res.json({
-      order: orders[0],
-      items: orderItems
+      success: true,
+      data: orders,
+      count: orders.length
     });
   } catch (error) {
-    console.error('Get order error:', error);
-    res.status(500).json({ message: 'Error fetching order' });
+    console.error('Get orders error:', error);
+    res.status(500).json({ 
+      success: false,
+      message: 'Error fetching orders' 
+    });
   }
 });
 
 // Admin Routes
-
-// Get all products for admin (including inactive)
 app.get('/api/admin/products', requireAdmin, async (req, res) => {
   try {
     const [products] = await pool.execute(`
-      SELECT id, name, category, size, price, image_url, description, featured, stock_quantity, active, created_at 
+      SELECT id, name, category, size, price, image_url, description, featured, stock_quantity, created_at 
       FROM products 
-      ORDER BY active DESC, created_at DESC
+      ORDER BY created_at DESC
     `);
-    res.json(products);
+    res.json({
+      success: true,
+      data: products,
+      count: products.length
+    });
   } catch (error) {
     console.error('Admin get products error:', error);
-    res.status(500).json({ message: 'Error fetching products' });
+    res.status(500).json({ 
+      success: false,
+      message: 'Error fetching products' 
+    });
   }
 });
 
 // Add new product
 app.post('/api/admin/products', requireAdmin, async (req, res) => {
   try {
-    const { name, category, size, price, image_url, description, featured, stock_quantity, active } = req.body;
+    const { name, category, size, price, image_url, description, featured, stock_quantity } = req.body;
     
-    // Validate required fields
     if (!name || !category || !size || !price) {
-      return res.status(400).json({ message: 'Name, category, size, and price are required' });
+      return res.status(400).json({ 
+        success: false,
+        message: 'Name, category, size, and price are required' 
+      });
     }
 
     const [result] = await pool.execute(
-      `INSERT INTO products (name, category, size, price, image_url, description, featured, stock_quantity, active) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO products (name, category, size, price, image_url, description, featured, stock_quantity) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         name, 
         category, 
@@ -551,18 +642,21 @@ app.post('/api/admin/products', requireAdmin, async (req, res) => {
         image_url || '', 
         description || '', 
         featured ? 1 : 0, 
-        parseInt(stock_quantity) || 100,
-        active !== undefined ? active : true
+        parseInt(stock_quantity) || 100
       ]
     );
 
     res.status(201).json({ 
+      success: true,
       message: 'Product created successfully',
       productId: result.insertId 
     });
   } catch (error) {
     console.error('Admin create product error:', error);
-    res.status(500).json({ message: 'Error creating product: ' + error.message });
+    res.status(500).json({ 
+      success: false,
+      message: 'Error creating product: ' + error.message 
+    });
   }
 });
 
@@ -570,16 +664,18 @@ app.post('/api/admin/products', requireAdmin, async (req, res) => {
 app.put('/api/admin/products/:id', requireAdmin, async (req, res) => {
   try {
     const productId = req.params.id;
-    const { name, category, size, price, image_url, description, featured, stock_quantity, active } = req.body;
+    const { name, category, size, price, image_url, description, featured, stock_quantity } = req.body;
     
-    // Validate required fields
     if (!name || !category || !size || !price) {
-      return res.status(400).json({ message: 'Name, category, size, and price are required' });
+      return res.status(400).json({ 
+        success: false,
+        message: 'Name, category, size, and price are required' 
+      });
     }
 
     const [result] = await pool.execute(
       `UPDATE products 
-       SET name = ?, category = ?, size = ?, price = ?, image_url = ?, description = ?, featured = ?, stock_quantity = ?, active = ?
+       SET name = ?, category = ?, size = ?, price = ?, image_url = ?, description = ?, featured = ?, stock_quantity = ?
        WHERE id = ?`,
       [
         name, 
@@ -590,23 +686,31 @@ app.put('/api/admin/products/:id', requireAdmin, async (req, res) => {
         description || '', 
         featured ? 1 : 0, 
         parseInt(stock_quantity) || 100, 
-        active ? 1 : 0,
         productId
       ]
     );
 
     if (result.affectedRows === 0) {
-      return res.status(404).json({ message: 'Product not found' });
+      return res.status(404).json({ 
+        success: false,
+        message: 'Product not found' 
+      });
     }
 
-    res.json({ message: 'Product updated successfully' });
+    res.json({ 
+      success: true,
+      message: 'Product updated successfully' 
+    });
   } catch (error) {
     console.error('Admin update product error:', error);
-    res.status(500).json({ message: 'Error updating product: ' + error.message });
+    res.status(500).json({ 
+      success: false,
+      message: 'Error updating product: ' + error.message 
+    });
   }
 });
 
-// Delete product (permanent delete)
+// Delete product
 app.delete('/api/admin/products/:id', requireAdmin, async (req, res) => {
   try {
     const productId = req.params.id;
@@ -614,77 +718,72 @@ app.delete('/api/admin/products/:id', requireAdmin, async (req, res) => {
     const [result] = await pool.execute('DELETE FROM products WHERE id = ?', [productId]);
 
     if (result.affectedRows === 0) {
-      return res.status(404).json({ message: 'Product not found' });
+      return res.status(404).json({ 
+        success: false,
+        message: 'Product not found' 
+      });
     }
 
-    res.json({ message: 'Product deleted successfully' });
-  } catch (error) {
-    console.error('Admin delete product error:', error);
-    res.status(500).json({ message: 'Error deleting product: ' + error.message });
-  }
-});
-
-// Admin orders management
-app.get('/api/admin/orders', requireAdmin, async (req, res) => {
-  try {
-    const [orders] = await pool.execute(`
-      SELECT o.*, 
-        (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) as item_count
-      FROM orders o 
-      ORDER BY order_date DESC
-    `);
-    res.json(orders);
-  } catch (error) {
-    console.error('Admin get orders error:', error);
-    res.status(500).json({ message: 'Error fetching orders' });
-  }
-});
-
-// Update order status
-app.put('/api/admin/orders/:id/status', requireAdmin, async (req, res) => {
-  try {
-    const orderId = req.params.id;
-    const { status } = req.body;
-    
-    const validStatuses = ['pending', 'confirmed', 'shipped', 'delivered', 'cancelled'];
-    if (!validStatuses.includes(status)) {
-      return res.status(400).json({ message: 'Invalid status' });
-    }
-
-    const [result] = await pool.execute(
-      'UPDATE orders SET status = ? WHERE id = ?',
-      [status, orderId]
-    );
-
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ message: 'Order not found' });
-    }
-
-    res.json({ message: 'Order status updated successfully' });
-  } catch (error) {
-    console.error('Admin update order status error:', error);
-    res.status(500).json({ message: 'Error updating order status' });
-  }
-});
-
-// Health check
-app.get('/api/health', async (req, res) => {
-  try {
-    await pool.execute('SELECT 1');
     res.json({ 
-      status: 'OK', 
-      database: 'Connected'
+      success: true,
+      message: 'Product deleted successfully' 
     });
   } catch (error) {
-    res.status(500).json({ status: 'Error', database: 'Disconnected' });
+    console.error('Admin delete product error:', error);
+    res.status(500).json({ 
+      success: false,
+      message: 'Error deleting product: ' + error.message 
+    });
   }
+});
+
+// Serve React app for all other routes (for production)
+if (process.env.NODE_ENV === 'production') {
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'client/build', 'index.html'));
+  });
+}
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({
+    success: false,
+    message: 'Internal server error',
+    ...(process.env.NODE_ENV === 'development' && { error: error.message })
+  });
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({
+    success: false,
+    message: 'Route not found'
+  });
 });
 
 // Start server
-initializeDatabase().then(() => {
-  app.listen(PORT, () => {
-    console.log(`🚀 Server running on http://localhost:${PORT}`);
-    console.log(`📸 Images serving from: http://localhost:${PORT}/images/`);
-    console.log(`📱 WhatsApp notifications enabled for: 0796989762`);
-  });
-});
+async function startServer() {
+  try {
+    const connectionSuccess = await testConnection();
+    if (!connectionSuccess) {
+      console.log('❌ Cannot start server without database connection');
+      process.exit(1);
+    }
+    
+    await initializeDatabase();
+    
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`🚀 Server running on port ${PORT}`);
+      console.log(`🌐 Access via: http://localhost:${PORT}`);
+      console.log(`🌍 Public URL: http://YOUR_SERVER_IP:${PORT}`);
+      console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`🔧 API Health: http://localhost:${PORT}/api/health`);
+    });
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+startServer();
