@@ -8,6 +8,7 @@ const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -56,7 +57,8 @@ const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
   port: process.env.DB_PORT || 3306,
   user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || 'dzika.123', // Using your password directly as fallback
+  password: process.env.DB_PASSWORD || 'dzika.123',
+  ssl: { rejectUnauthorized: true },
   database: process.env.DB_NAME || 'peaqbodycare',
   waitForConnections: true,
   connectionLimit: 10,
