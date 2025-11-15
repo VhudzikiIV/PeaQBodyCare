@@ -8,7 +8,6 @@ const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 
-
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -52,14 +51,16 @@ if (process.env.NODE_ENV === 'production') {
   app.use(express.static(path.join(__dirname, 'client/build')));
 }
 
-// ✅ UPDATED: MySQL connection pool with correct password
+// ✅ FIXED: MySQL connection pool with SSL handling
 const pool = mysql.createPool({
   host: process.env.DB_HOST || 'localhost',
   port: process.env.DB_PORT || 3306,
   user: process.env.DB_USER || 'root',
   password: process.env.DB_PASSWORD || 'dzika.123',
-  ssl: { rejectUnauthorized: true },
   database: process.env.DB_NAME || 'peaqbodycare',
+  ssl: process.env.DB_HOST === 'aws.connect.psdb.cloud' ? 
+    { rejectUnauthorized: false } : 
+    false,
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
@@ -77,7 +78,8 @@ async function testConnection() {
       port: process.env.DB_PORT || 3306,
       user: process.env.DB_USER || 'root',
       database: process.env.DB_NAME || 'peaqbodycare',
-      password: process.env.DB_PASSWORD ? '***' : 'not set'
+      password: process.env.DB_PASSWORD ? '***' : 'not set',
+      ssl: process.env.DB_HOST === 'aws.connect.psdb.cloud' ? 'disabled' : 'false'
     });
 
     connection = await pool.getConnection();
